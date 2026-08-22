@@ -62,6 +62,38 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-22: **the file-descriptor leak under everything.** Three days of
+  display symptoms — passengers rebuilding their virtual display hundreds of
+  times a day, leases arriving in 6-minute gaps, air15 dropping to a non-MIRA
+  1080p display — all trace to one line in `sh()`:
+
+      kill(p.processIdentifier, SIGKILL)
+      return ("", 124)          // and the comment: "abandon the pipe"
+
+  The claim that "letting the Pipe deallocate closes our read end" is false. The
+  Pipe cannot deallocate there: `p` still references it as stdout AND stderr,
+  and Foundation keeps `p` alive until the child is reaped — which that path
+  never did. Every timed-out shell command leaked both descriptors permanently.
+  Measured on the pro at 18 h uptime: **2,568 open fds, 2,555 of them PIPE.**
+  Once the daemon neared its ceiling `Process.run()` began throwing, and the
+  catch returned `("", 127)` — indistinguishable from a remote "command not
+  found". So every ssh failed while the log accused the far end. Rides stopped
+  landing, leases expired, and passengers tore down displays that were fine.
+  Fixes: close both handles and reap the child on the timeout path; close them
+  explicitly on the success path too rather than trusting ARC; return 126 with a
+  loud "SPAWN FAILED (local, not remote)" so a local exhaustion can never again
+  masquerade as a remote failure; and sample the fd count on every health beat,
+  warning past 512.
+  After the fix, 62 beats: **12 fds, 0 pipes**, flat across heartbeat samples,
+  zero ride misses, both passengers converged on MIRA's canvas.
+  Lesson: the daemon degraded with uptime and every symptom appeared somewhere
+  else — CoreGraphics, Jump, the network, the ride TTL. A resource leak does not
+  announce itself; it waits until exhaustion and then impersonates whatever it
+  breaks first. Cheap invariants about the process itself (fd count, child
+  count) are worth more than any amount of reasoning about the subsystem that
+  happens to fail. Three earlier fixes in this log were treating downstream
+  symptoms of this line.
+
 - 2026-08-21: air15 tore its display down at 23:49:59 and dropped to a non-MIRA
   1080p display — the "resolution bounce" as the user actually experiences it.
   Not a mystery this time; the instrumentation named it outright:

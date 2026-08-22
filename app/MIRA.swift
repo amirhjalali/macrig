@@ -16,6 +16,16 @@ import ServiceManagement
 // MARK: - Shell (small residue: ssh, ping, osascript)
 
 @discardableResult
+// How many descriptors this process holds. Cheap enough to sample on a
+// heartbeat, and the number that would have named the 2026-08-22 fd leak on day
+// one instead of day three.
+func openFileDescriptorCount() -> Int {
+    var n = 0
+    let lim = min(getdtablesize(), 65536)
+    for fd in 0..<lim where fcntl(fd, F_GETFD) != -1 { n += 1 }
+    return n
+}
+
 func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -23,7 +33,18 @@ func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32)
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
-    do { try p.run() } catch { return ("", 127) }
+    // A spawn failure is NOT a remote "command not found", and conflating the two
+    // cost two days: once the daemon ran out of file descriptors every ssh came
+    // back as a bare `code 127` with empty output, which reads exactly like the
+    // far end missing a binary. Say which it is.
+    do { try p.run() } catch {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+        log("SPAWN FAILED (local, not remote): \(error.localizedDescription) — "
+          + "openFDs=\(openFileDescriptorCount())")
+        emit("spawn_failed", [("fds", .n(Double(openFileDescriptorCount())))])
+        return ("", 126)
+    }
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline { usleep(50_000) }
     if p.isRunning {
@@ -32,14 +53,33 @@ func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32)
         // its children rather than killing them, and an orphaned ssh still
         // holding the pipe's write end means the read to EOF never returns.
         // That is how a 20 s timeout became a multi-minute stall of the whole
-        // daemon (2026-08-16). Kill hard and abandon the pipe — letting the
-        // Pipe deallocate closes our read end, so any orphan writing into it
-        // takes EPIPE and dies too.
+        // daemon (2026-08-16). Kill hard rather than terminate().
+        //
+        // "Abandon the pipe — letting the Pipe deallocate closes our read end"
+        // was wrong, and it was the most expensive line in this file. The Pipe
+        // CANNOT deallocate here: `p` still references it as stdout and stderr,
+        // and `p` outlives this scope inside Foundation until the child is
+        // reaped. So every timeout leaked both descriptors, permanently.
+        // Measured on the pro 2026-08-22 after 18 h uptime: 2,568 open fds, of
+        // which 2,555 were PIPE. When the daemon hit its ceiling, Process.run()
+        // began throwing — surfacing as `code 127, empty output` on every ssh,
+        // which looked like a remote failure. Rides then stopped landing, leases
+        // expired, and passengers tore their displays down. Every uptime-
+        // correlated symptom of the last three days traces back here.
+        // Close both ends explicitly and reap the child.
         kill(p.processIdentifier, SIGKILL)
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+        p.waitUntilExit()
         return ("", 124)
     }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
+    // Explicit, not left to ARC. The whole fd leak came from assuming a Pipe
+    // deallocates when this scope ends; it does not while Process still holds
+    // it. Closing by hand costs nothing and cannot be wrong.
+    try? pipe.fileHandleForReading.close()
+    try? pipe.fileHandleForWriting.close()
     return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
 }
 
@@ -2486,6 +2526,14 @@ func runDaemon(cfg: Config) -> Never {
         }
         if Date() >= nextHealth {
             writeHealth(); nextHealth = Date().addingTimeInterval(300)
+            // A descriptor leak is invisible until it is fatal, and then it
+            // disguises itself as somebody else's failure. Sample it.
+            let fds = openFileDescriptorCount()
+            emit("fds", [("n", .n(Double(fds)))])
+            if fds > 512 {
+                log("WARNING: \(fds) open file descriptors — leaking. "
+                  + "This ends as spawn failures and unplaceable rides.")
+            }
         }
         // Sleep, but return the instant ride state changes on disk.
         _ = wake.wait(timeout: .now() + cfg.reconcileSeconds)
