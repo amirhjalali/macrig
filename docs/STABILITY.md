@@ -62,6 +62,34 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-23: the pro took the wheel from air15 cleanly — flag removed, beacon
+  installed, `mira wheel` reporting one driver — and the Air's menu bar went on
+  showing the steering wheel and "Driving N passengers" anyway. The handoff
+  worked; the UI lied about it.
+  Cause: `rebuild()` was only ever called from launch, the setting toggles, and
+  this app's own drive/stop. LOSING the wheel happens by a peer writing files
+  underneath us over ssh, which runs no code in the menu process, so nothing
+  ever redrew. The only timer refreshed health, not the menu.
+  Not cosmetic. The stale menu still offered "Stop Driving", and `stop()`
+  unconditionally called `endRide` on every passenger and `clearWheel` on every
+  viewer — so one click on the machine that had already yielded would delete the
+  NEW driver's rides fleet-wide and wipe its beacons. A one-click way to break
+  the session the user had just started, sitting behind a button that reads like
+  a no-op.
+  Fixes: a 3 s timer that recomputes a cheap state signature (driving flag,
+  claim, beacon driver, exclusions) and redraws only when it moves; and both
+  Stop paths — the menu item and the `stop` verb — now no-op unless this machine
+  actually holds the wheel, saying who does instead.
+  Verified live: `mira stop` on air15 while pro drove printed "not driving — pro
+  holds the wheel; left its rides alone", and pro's ride on the mini was
+  byte-identical before and after.
+  Lesson: state that arrives by another machine writing your files needs a
+  reader. Every other MIRA surface polls or watches; the menu bar alone was
+  event-driven off its own actions, so it could only ever be right about
+  decisions it made itself. And any destructive action must re-check the
+  condition its label claims, because a stale UI turns "stop what I am doing"
+  into "stop what someone else is doing".
+
 - 2026-08-22: **the file-descriptor leak under everything.** Three days of
   display symptoms — passengers rebuilding their virtual display hundreds of
   times a day, leases arriving in 6-minute gaps, air15 dropping to a non-MIRA

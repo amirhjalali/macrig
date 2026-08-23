@@ -2595,6 +2595,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     let cfg = loadConfig()
     lazy var me = selfMachine(cfg)
     var scrollTap: CFMachPort?
+    var lastMenuState = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // Only the daemon used to set this, so every event the menu app emitted
@@ -2613,6 +2614,10 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         writeViewerHealth()
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.writeViewerHealth()
+        }
+        // Cheap: four stats and a small string compare, redrawing only on change.
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.refreshMenuIfChanged()
         }
         maybeResumeSessions()
     }
@@ -2703,6 +2708,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         m.addItem(.separator())
         m.addItem(withTitle: "Quit MIRA", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = m
+        lastMenuState = menuStateSignature()
     }
 
     @objc func toggleMachine(_ sender: NSMenuItem) {
@@ -2871,7 +2877,23 @@ extension MenuApp {
         }
     }
     @objc func stop() {
+        // Only tear the fleet down if we ACTUALLY hold the wheel. A machine that
+        // has already yielded gets its driving flag removed by the new driver
+        // over ssh — no code in this process runs — so the menu could still be
+        // offering "Stop Driving" long after the wheel moved. Acting on that
+        // stale item used to end the NEW driver's rides on every passenger and
+        // wipe its beacons: the exact opposite of what the click means, and a
+        // one-click way to break the session the user had just started.
+        let wasDriving = FileManager.default.fileExists(atPath: drivingFlag.path)
         try? FileManager.default.removeItem(at: drivingFlag)
+        sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close our own viewer either way
+        guard wasDriving else {
+            log("Stop Driving clicked but we do not hold the wheel — "
+              + "leaving \(readWheel()?.driver ?? "the current driver")'s rides alone")
+            notify("Not driving — \(readWheel()?.driver ?? "another machine") holds the wheel")
+            rebuild()
+            return
+        }
         try? FileManager.default.removeItem(at: wheelFile)
         for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
         // Release the wheel everywhere too, so no other menu bar goes on
@@ -2880,9 +2902,26 @@ extension MenuApp {
         DispatchQueue.global().async {
             _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
         }
-        sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
         notify("Stopped driving — passengers return to console")
         rebuild()
+    }
+
+    // The menu bar was a snapshot of the last time THIS app acted. Losing the
+    // wheel happens by a peer writing files underneath us, which runs no code
+    // here, so a machine that had handed over went on showing the steering wheel
+    // and "Driving N passengers" indefinitely (air15, 2026-08-23, after the pro
+    // took over cleanly). Poll a cheap signature and redraw only when it moves.
+    func menuStateSignature() -> String {
+        let claim = (try? String(contentsOf: drivingFlag, encoding: .utf8)) ?? ""
+        let driving = FileManager.default.fileExists(atPath: drivingFlag.path)
+        let wheel = readWheel().map { "\($0.driver)@\($0.claimedAt)" } ?? "-"
+        return "\(driving)|\(claim)|\(wheel)|\(loadExcluded().sorted().joined(separator: ","))"
+    }
+
+    @objc func refreshMenuIfChanged() {
+        let sig = menuStateSignature()
+        guard sig != lastMenuState else { return }
+        rebuild()   // rebuild() re-stamps lastMenuState
     }
     @objc func runDoc() {
         DispatchQueue.global().async {
@@ -3434,13 +3473,22 @@ case "wheel":
     }
     exit(s.claimants.count > 1 ? 1 : 0)
 case "stop":
+    // Same guard as the menu's Stop Driving: a machine that already yielded must
+    // not tear down the CURRENT driver's rides. Stopping something you are not
+    // doing has to be a no-op, not a fleet-wide teardown.
     let cfg = loadConfig(); let me = selfMachine(cfg)
+    let wasDriving = FileManager.default.fileExists(atPath: drivingFlag.path)
     try? FileManager.default.removeItem(at: drivingFlag)
-    try? FileManager.default.removeItem(at: wheelFile)
-    for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
-    _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
-    sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
-    print("stopped — passengers return to console")
+    sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close our own viewer either way
+    if wasDriving {
+        try? FileManager.default.removeItem(at: wheelFile)
+        for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+        _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
+        print("stopped — passengers return to console")
+    } else {
+        print("not driving — \(readWheel()?.driver ?? "another machine") holds the wheel; "
+            + "left its rides alone")
+    }
 case "console":
     let cfg = loadConfig()
     try? FileManager.default.removeItem(at: rideFile)
